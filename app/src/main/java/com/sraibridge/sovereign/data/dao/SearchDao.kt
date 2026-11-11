@@ -2,54 +2,54 @@ package com.sraibridge.sovereign.data.dao
 
 import androidx.room.Dao
 import androidx.room.Query
-import com.sraibridge.sovereign.data.entity.DocumentEntity
 
 @Dao
 interface SearchDao {
+    @Query(
+        """
+        SELECT d.source_id, d.title, s.original_name AS source_name,
+               SUM(p.tfidf * qp.tfidf) / (SQRT(ds.norm_sq) * SQRT(:queryNormSq)) AS cosine_sim
+        FROM postings p
+        JOIN (
+            SELECT term_id, tfidf
+            FROM postings
+            WHERE source_id = :querySourceId
+        ) qp ON qp.term_id = p.term_id
+        JOIN doc_stats ds ON ds.source_id = p.source_id
+        JOIN documents d ON d.source_id = p.source_id
+        JOIN sources s ON s.source_id = d.source_id
+        WHERE p.source_id != :querySourceId
+        GROUP BY p.source_id
+        HAVING cosine_sim >= :threshold
+        ORDER BY cosine_sim DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun similaritySearch(
+        querySourceId: String,
+        threshold: Double = 0.1,
+        limit: Int = 20,
+        queryNormSq: Double = 1.0
+    ): List<SimilarityResult>
 
-    @Query("SELECT * FROM documents WHERE content_fts MATCH :query ORDER BY rank")
-    suspend fun ftsSearch(query: String): List<DocumentEntity>
+    @Query("SELECT term, tfidf FROM postings p JOIN terms t ON t.term_id = p.term_id WHERE p.source_id = :sourceId")
+    suspend fun getDocumentVector(sourceId: String): List<TermWeight>
 
-    @Query("SELECT * FROM documents WHERE id = :docId")
-    suspend fun getDocumentById(docId: Long): DocumentEntity?
+    @Query("SELECT value FROM corpus_meta WHERE key = 'similarity_threshold'")
+    suspend fun getSimilarityThreshold(): String?
 
-    @Query("SELECT COUNT(*) FROM documents")
-    suspend fun documentCount(): Int
-
-    @Query("""
-        SELECT d.*, (
-            SELECT SUM(tfidf)
-            FROM (
-                SELECT (CAST(freq AS REAL) / (SELECT MAX(freq) FROM term_frequencies WHERE doc_id = d.id)) *
-                       (LOG((SELECT COUNT(*) FROM documents) / CAST((SELECT COUNT(*) FROM term_frequencies WHERE term = tf.term) AS REAL)))
-                       AS tfidf
-                FROM term_frequencies tf WHERE tf.doc_id = d.id
-            )
-        ) AS relevance
-        FROM documents d
-        WHERE d.id IN (
-            SELECT doc_id FROM term_frequencies
-            WHERE term IN (SELECT value FROM json_each(:terms))
-            GROUP BY doc_id
-            ORDER BY SUM(tfidf) DESC
-            LIMIT :limit
-        )
-        ORDER BY relevance DESC
-    """)
-    suspend fun tfidfSearch(terms: String, limit: Int): List<DocumentEntity>
-
-    @Query("""
-        INSERT INTO documents (title, source_path, content_text, content_plain, sha3_512, file_type, ingested_at, word_count)
-        VALUES (:title, :sourcePath, :contentText, :contentPlain, :sha3, :fileType, :ingestedAt, :wordCount)
-    """)
-    suspend fun insertDocument(
-        title: String,
-        sourcePath: String,
-        contentText: String,
-        contentPlain: String,
-        sha3: String,
-        fileType: String,
-        ingestedAt: Long,
-        wordCount: Int
-    ): Long
+    @Query("SELECT value FROM corpus_meta WHERE key = 'N'")
+    suspend fun getDocumentCount(): String?
 }
+
+data class SimilarityResult(
+    val source_id: String,
+    val title: String,
+    val source_name: String?,
+    val cosine_sim: Double
+)
+
+data class TermWeight(
+    val term: String,
+    val tfidf: Double
+)
