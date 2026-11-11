@@ -1,0 +1,2 @@
+-keep class com.sraibridge.sovereign.data.** { *; }
+-keep class com.sraibridge.sovereign.ghost.** { *; }

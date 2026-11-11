@@ -1,49 +1,52 @@
 {
   "name": "sovereign-research-archive",
   "version": "9.1.0",
-  "description": "Sovereign Research AI - GHOST Kernel: Local, Vendorless, Cloudless Beyond Architecture",
+  "description": "Sovereign Research Archive - GHOST Kernel: Local, Vendorless, Cloudless, Permanence",
   "main": "src/start_ghost.js",
   "scripts": {
     "start": "node src/start_ghost.js",
     "test": "node src/test_ghost.js",
-    "build": "bash build_apk.sh",
-    "index": "node src/research_index.js",
-    "verify": "node -p \"require('./src/ghost_kernel').verifyIntegrity()\""
+    "ingest": "node src/ingest_pipeline.js",
+    "build-index": "node src/research_index.js",
+    "build-apk": "bash build_apk.sh"
   },
-  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sraibridge-cyber/sovereign-research-archive"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "commander": "^11.1.0"
+  },
+  "keywords": [
+    "sovereign",
+    "research",
+    "archive",
+    "ghost",
+    "kernel",
+    "merkle",
+    "fts5",
+    "tf-idf",
+    "android",
+    "offline-first"
+  ],
+  "author": "SRAI Bridge Cyber",
+  "contributors": [
+    {
+      "name": "Kyle",
+      "role": "Architect"
+    },
+    {
+      "name": "Chief of Staff",
+      "role": "Coordinator"
+    }
+  ],
   "engines": {
     "node": ">=18.0.0"
   },
-  "os": [
-    "android",
-    "linux",
-    "marklownode",
-    "dartwin"
-  ],
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/sraibridge-cyber/sovereign-research-archive.git"
-  },
-  "kernel": {
-    "version": "9.1.0",
-    "name": "GHOST",
-    "architect": "Kyle S. Whitlock",
-    "alias": "Geometric Heuristic Organism for Sovereign Thought",
-    "backend": "Bifurcated Backend Architecture (handler A on port 7766, handler B on port 7767)",
-    "storage": "Shared state.json with SHA3-512 Merkle integrity seals",
-    "runtime": "Termux on Android (v7.0++)",
-    "security": {
-      "hash": "SHA3-512",
-      "aes": "AES-GCM 256",
-      "signature": "Ed25519"
-    },
-    "coherence": {
-      "domains": 8,
-      "target": "0.99972 - 0.99992",
-      "draftTolerance": "0.0025"
-    },
-    "laws": 17,
-    "frequency": "1440 MHz (Bridge)",
-    "dominion": "Advanced Sovereignty Standard (DX-Ψ-11Q-ECL-743)"
-  }
+  "dominion": "Advanced Sovereignty Standard (DX-\u03a8-11Q-ECL-743)"
 }

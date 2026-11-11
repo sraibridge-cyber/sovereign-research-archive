@@ -1,0 +1,14 @@
+# Sovereign Research Archive - Python tools dependencies
+# pip install -r tools/requirements.txt
+
+# Core
+sqlite3
+
+# PDF extraction (install at least one)
+PyMuPDF>=1.23.0
+# pdfplumber>=0.10.0  # alternative to PyMuPDF
+
+# DOCX extraction
+python-docx>=1.1.0
+
+# Note: SQLite FTS5 is included with Python 3.x's sqlite3 module

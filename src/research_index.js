@@ -1,247 +1,306 @@
-/**
- * research_index.js — Sovereign Research Archive Corpus Index
- * Complex System Sanity Labs
- *
- * Navigation and ingestion engine for the full research corpus
- * (2,000+ files across Google Drive and GitHub).
- *
- * Maps every top-level research folder, subfolder, and file naming
- * convention so Ghost and other agents can navigate the corpus
- * without scanning the drive each time.
- *
- * Rule: Nothing is ever deleted. All information is preserved.
- */
+// research_index.js — Sovereign Research Archive Ingestion Orchestrator
+// Builds FTS5 + TF-IDF search database from ingested documents
+// SHA3-512 Merkle seals on every write
 
-'use strict';
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 
-// ---------------------------------------------------------------------------
-// TOP-LEVEL FOLDER MAP — 14 project folders
-// ---------------------------------------------------------------------------
-
-const FOLDER_MAP = {
-  // ---- Active Research Frameworks ----
-  'Coherence-Calculus': {
-    description: 'Core mathematical framework — 16 discovered invariants, proofs, benchmarks, export drafts, and arXiv/Nature submission materials. Most active research folder.',
-    subfolders: {
-      'papers/':     { description: 'Formal paper drafts, write-ups, and formatted documents (61 files)' },
-      'exports/':    { description: 'Export-ready versions — PDFs, formatted outputs, submission-ready files (72 files)' },
-      'benchmarks/': { description: 'Benchmark data, test results, validation runs, measurement datasets (22 files)' }
+class ResearchIndex {
+    constructor(dbPath) {
+        this.dbPath = dbPath || path.join(process.cwd(), 'research_index.db');
+        this.db = null;
+        this.initialized = false;
     }
-  },
-  'AI-Research-Threads': {
-    description: 'Nonlinear research notes, threads, and pattern dumps that feed into formal frameworks. The idea capture layer.'
-  },
-  'Frameworks': {
-    description: 'CSST (Constitutional Substrate Stability Theory) and other cross-cutting theoretical frameworks. Related to Coherence Calculus but distinct.'
-  },
-  'Resonance-Archive': {
-    description: 'The 10-month Resonance research journey — mathematical invariants, early drafts, Nature journal submission attempt. Historical but foundational.'
-  },
 
-  // ---- Harmony Labs (Hardware & Software Design) ----
-  'Harmony-Labs': {
-    description: 'Parent folder for all Harmony Labs product work — 20+ hardware designs, 60+ software designs/attempts, safety kits, and compliance documentation.',
-    subfolders: {
-      'Ghost/':     { description: 'Ghost AI agent — all versions and builds. Most active Harmony sub-project.' },
-      'Ghost/v6/':  { description: 'Ghost version 6 files' },
-      'Ghost/v7/':  { description: 'Ghost version 7 files — largest versioned batch' },
-      'Ghost/v8/':  { description: 'Ghost version 8 files' },
-      'Ghost/v9/':  { description: 'Ghost version 9 files — most recent versioned work' },
-      'Ghost/':     { description: '~25 unversioned Ghost files — docs, benchmarks, handoff notes, package configs with no clear version tag' }
+    async initialize() {
+        const Database = (await import('better-sqlite3')).default;
+        this.db = new Database(this.dbPath);
+        this.db.pragma('journal_mode = WAL');
+        this.db.pragma('synchronous = NORMAL');
+        this.db.pragma('page_size = 65536');
+        this.db.pragma('cache_size = -64000');
+
+        this._createTables();
+        this.initialized = true;
     }
-  },
 
-  // ---- Bridge / Agent Infrastructure ----
-  'Bridge-A2A': {
-    description: 'Agent-to-Agent communication protocols and research. Architecture for how AI agents talk to each other.',
-    subfolders: {
-      'Protocols/': { description: 'Formal protocol specs and definitions' },
-      'Research/':  { description: 'Supporting research, background, and explorations' }
+    _createTables() {
+        this.db.exec(`
+            CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+                title,
+                content_plain,
+                content_text,
+                tokenize='porter unicode61',
+                content='documents',
+                content_rowid='rowid'
+            );
+
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                content_text TEXT NOT NULL DEFAULT '',
+                content_plain TEXT NOT NULL DEFAULT '',
+                sha3_512 TEXT NOT NULL UNIQUE,
+                file_type TEXT NOT NULL DEFAULT 'txt',
+                ingested_at INTEGER NOT NULL,
+                word_count INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS term_frequencies (
+                doc_id INTEGER NOT NULL,
+                term TEXT NOT NULL,
+                freq INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (doc_id, term),
+                FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS corpus_stats (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                total_docs INTEGER NOT NULL DEFAULT 0,
+                total_terms INTEGER NOT NULL DEFAULT 0,
+                last_updated INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS merkle_seals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version INTEGER NOT NULL,
+                seal_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                description TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_documents_sha3 ON documents(sha3_512);
+            CREATE INDEX IF NOT EXISTS idx_term_frequencies_term ON term_frequencies(term);
+            CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_path);
+        `);
     }
-  },
-  'Bridge-Infra-Early': {
-    description: 'Early-stage bridge infrastructure work — predecessor to Bridge-A2A. Historical reference.'
-  },
-  'SR-AIbridge-Origin': {
-    description: 'The original SR AI Bridge origin files — earliest bridge architecture work.'
-  },
 
-  // ---- Other Active Projects ----
-  'Grimoire-Oracle': {
-    description: 'Grimoire / Oracle system designs — AI personality, knowledge retrieval, or oracle-style agent work'
-  },
-  'Praetor': {
-    description: 'Praetor system — governance, safety, or oversight-layer AI work'
-  },
-  'Sovereign-Vault': {
-    description: 'Sovereign AI research — autonomy, self-governance, and related design work'
-  },
-  'MRCL-Coding-AI': {
-    description: 'MRCL (Multi-Role Coding Layer) — AI-assisted coding system design'
-  },
-  'Index-Kernel': {
-    description: 'Core indexing and kernel-level infrastructure research'
-  },
-  'DLC-Modules': {
-    description: 'DLC (Downloadable Content / Dynamic Logic Component) module designs'
-  }
-};
-
-// ---------------------------------------------------------------------------
-// FILE NAMING CONVENTIONS
-// ---------------------------------------------------------------------------
-
-const NAMING_PATTERNS = {
-  'GHOST_*':       { meaning: 'Ghost AI agent file (caps = formal/canonical)' },
-  'ghost_*':       { meaning: 'Ghost file (lowercase = working/draft)' },
-  'CC_*':          { meaning: 'Coherence Calculus document' },
-  'cc_*':          { meaning: 'Coherence Calculus document' },
-  'CSST_*':        { meaning: 'Constitutional Substrate Stability Theory doc' },
-  'v6/v7/v8/v9':   { meaning: 'Ghost version number' },
-  '*_ARXIV_*':     { meaning: 'Prepared or attempted arXiv submission' },
-  '*_DRAFT*':      { meaning: 'Work in progress, not finalized' },
-  '*_HANDOFF*':    { meaning: 'Documentation intended for continuity / transition' },
-  '*_benchmark*':  { meaning: 'Measurement or evaluation data' },
-  '*_package.json':{ meaning: 'Software package configuration' }
-};
-
-// ---------------------------------------------------------------------------
-// NAVIGATION HELPERS
-// ---------------------------------------------------------------------------
-
-function findFolder(name) {
-  if (FOLDER_MAP[name]) return FOLDER_MAP[name];
-  // Fuzzy match
-  const lower = name.toLowerCase();
-  for (const key of Object.keys(FOLDER_MAP)) {
-    if (key.toLowerCase().includes(lower) || lower.includes(key.toLowerCase())) {
-      return FOLDER_MAP[key];
+    sha3(data) {
+        return crypto.createHash('sha3-512').update(data).digest('hex');
     }
-  }
-  return null;
-}
 
-function navigate(query) {
-  const q = query.toLowerCase();
+    ingestDocument(title, sourcePath, contentText, contentPlain, fileType, ingestedAt) {
+        if (!this.initialized) throw new Error('ResearchIndex not initialized');
 
-  if (q.includes('coherence') || q.includes('calculus') || q.includes('invariant')) {
-    return {
-      folder: 'Coherence-Calculus',
-      path: 'Coherence-Calculus/papers/',
-      note: 'Start with /papers/ for drafts, /exports/ for formatted outputs'
-    };
-  }
-  if (q.includes('ghost') || q.includes('harmony')) {
-    return {
-      folder: 'Harmony-Labs/Ghost',
-      path: 'Harmony-Labs/Ghost/v9/',
-      note: 'v9 is newest; v7 has the largest historical batch'
-    };
-  }
-  if (q.includes('resonance') || q.includes('foundational') || q.includes('origin')) {
-    return {
-      folder: 'Resonance-Archive',
-      path: 'Resonance-Archive/',
-      note: 'Origin work — 10-month research journey'
-    };
-  }
-  if (q.includes('bridge') || q.includes('a2a') || q.includes('agent')) {
-    return {
-      folder: 'Bridge-A2A',
-      path: 'Bridge-A2A/Protocols/',
-      note: 'Current agent communication protocols'
-    };
-  }
-  if (q.includes('csst') || q.includes('safety') || q.includes('governance') || q.includes('framework')) {
-    return {
-      folder: 'Frameworks',
-      path: 'Frameworks/',
-      note: 'CSST and cross-cutting theoretical frameworks'
-    };
-  }
-  if (q.includes('sovereign') || q.includes('autonomy') || q.includes('vault')) {
-    return {
-      folder: 'Sovereign-Vault',
-      path: 'Sovereign-Vault/',
-      note: 'Sovereign AI / self-governance research'
-    };
-  }
-  if (q.includes('praetor') || q.includes('oversight')) {
-    return {
-      folder: 'Praetor',
-      path: 'Praetor/',
-      note: 'Governance and oversight-layer AI work'
-    };
-  }
-  if (q.includes('oracle') || q.includes('grimoire') || q.includes('personality')) {
-    return {
-      folder: 'Grimoire-Oracle',
-      path: 'Grimoire-Oracle/',
-      note: 'AI personality and oracle-style agent designs'
-    };
-  }
+        const sha3 = this.sha3(contentPlain);
+        const wordCount = contentPlain.split(/\s+/).filter(w => w.length > 0).length;
 
-  return null;
-}
+        const existing = this.db.prepare('SELECT id FROM documents WHERE sha3_512 = ?').get(sha3);
+        if (existing) {
+            return { deduped: true, id: existing.id, sha3 };
+        }
 
-function classifyFile(filename) {
-  const results = [];
-  for (const [pattern, info] of Object.entries(NAMING_PATTERNS)) {
-    const regex = new RegExp('^' + pattern.replace(/\./g, '\\.').replace(/\*/g, '.*') + '$', 'i');
-    if (regex.test(filename)) {
-      results.push({ pattern, meaning: info.meaning });
+        const insert = this.db.prepare(`
+            INSERT INTO documents (title, source_path, content_text, content_plain, sha3_512, file_type, ingested_at, word_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        const result = insert.run(title, sourcePath, contentText, contentPlain, sha3, fileType, ingestedAt, wordCount);
+        const docId = result.lastInsertRowid;
+
+        // Build term frequencies for TF-IDF
+        this._buildTermFrequencies(docId, contentPlain);
+
+        // Update FTS5 index
+        this.db.prepare(`
+            INSERT INTO documents_fts (rowid, title, content_plain, content_text)
+            VALUES (?, ?, ?, ?)
+        `).run(docId, title, contentPlain, contentText);
+
+        // Update corpus stats
+        this._updateCorpusStats();
+
+        // Create Merkle seal
+        this._createSeal(`Ingested: ${title}`);
+
+        return { deduped: false, id: docId, sha3, wordCount };
     }
-  }
-  return results;
+
+    _buildTermFrequencies(docId, text) {
+        const terms = text.toLowerCase()
+            .replace(/[^a-z0-9\s-]/g, ' ')
+            .split(/\s+/)
+            .filter(t => t.length > 2);
+
+        const freqMap = new Map();
+        for (const term of terms) {
+            freqMap.set(term, (freqMap.get(term) || 0) + 1);
+        }
+
+        const insert = this.db.prepare('INSERT OR REPLACE INTO term_frequencies (doc_id, term, freq) VALUES (?, ?, ?)');
+        const batch = this.db.transaction((entries) => {
+            for (const [term, freq] of entries) {
+                insert.run(docId, term, freq);
+            }
+        });
+
+        batch([...freqMap.entries()]);
+    }
+
+    _updateCorpusStats() {
+        const docCount = this.db.prepare('SELECT COUNT(*) AS count FROM documents').get();
+        const termCount = this.db.prepare('SELECT COUNT(DISTINCT term) AS count FROM term_frequencies').get();
+        this.db.prepare(`
+            INSERT OR REPLACE INTO corpus_stats (id, total_docs, total_terms, last_updated)
+            VALUES (1, ?, ?, ?)
+        `).run(docCount.count, termCount.count, Date.now());
+    }
+
+    _createSeal(description) {
+        const version = (this.db.prepare('SELECT COALESCE(MAX(version), 0) + 1 AS v FROM merkle_seals').get()?.v) || 1;
+        const prevSeal = this.db.prepare('SELECT seal_hash FROM merkle_seals ORDER BY id DESC LIMIT 1').get();
+        const docCount = this.db.prepare('SELECT COUNT(*) AS count FROM documents').get().count;
+        const sealData = `v${version}|${prevSeal?.seal_hash || 'GENESIS'}|${docCount}|${description}|${Date.now()}`;
+        const sealHash = this.sha3(sealData);
+
+        this.db.prepare(`
+            INSERT INTO merkle_seals (version, seal_hash, created_at, description)
+            VALUES (?, ?, ?, ?)
+        `).run(version, sealHash, Date.now(), description);
+
+        return sealHash;
+    }
+
+    // --- Search ---
+
+    ftsSearch(query, limit = 50) {
+        if (!this.initialized) throw new Error('ResearchIndex not initialized');
+        const ftsQuery = query.split(/\s+/).map(t => `${t}*`).join(' ');
+        return this.db.prepare(`
+            SELECT d.*, rank
+            FROM documents_fts
+            JOIN documents d ON d.id = documents_fts.rowid
+            WHERE documents_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+        `).all(ftsQuery, limit);
+    }
+
+    tfidfSearch(query, limit = 50) {
+        if (!this.initialized) throw new Error('ResearchIndex not initialized');
+
+        const terms = query.toLowerCase()
+            .replace(/[^a-z0-9\s-]/g, ' ')
+            .split(/\s+/)
+            .filter(t => t.length > 2);
+
+        if (terms.length === 0) return [];
+
+        const totalDocs = this.db.prepare('SELECT COUNT(*) AS count FROM documents').get().count;
+
+        const placeholders = terms.map(() => '?').join(',');
+        const results = this.db.prepare(`
+            SELECT
+                tf.doc_id,
+                d.title,
+                d.content_plain,
+                d.sha3_512,
+                d.source_path,
+                SUM(
+                    (CAST(tf.freq AS REAL) /
+                        (SELECT MAX(freq) FROM term_frequencies t2 WHERE t2.doc_id = tf.doc_id)
+                    ) *
+                    LOG(CAST(? AS REAL) /
+                        (SELECT CAST(COUNT(DISTINCT doc_id) AS REAL)
+                         FROM term_frequencies t3 WHERE t3.term = tf.term)
+                    )
+                ) AS score
+            FROM term_frequencies tf
+            JOIN documents d ON d.id = tf.doc_id
+            WHERE tf.term IN (${placeholders})
+            GROUP BY tf.doc_id
+            ORDER BY score DESC
+            LIMIT ?
+        `).all(totalDocs, ...terms, limit);
+
+        return results;
+    }
+
+    getStats() {
+        if (!this.initialized) return null;
+        const docCount = this.db.prepare('SELECT COUNT(*) AS count FROM documents').get().count;
+        const termCount = this.db.prepare('SELECT COUNT(DISTINCT term) AS count FROM term_frequencies').get().count;
+        const lastSeal = this.db.prepare('SELECT * FROM merkle_seals ORDER BY id DESC LIMIT 1').get();
+        const corpusStats = this.db.prepare('SELECT * FROM corpus_stats WHERE id = 1').get();
+
+        return {
+            documentCount: docCount,
+            uniqueTerms: termCount,
+            lastSeal,
+            corpusStats
+        };
+    }
+
+    getMerkleChain() {
+        return this.db.prepare('SELECT * FROM merkle_seals ORDER BY id ASC').all();
+    }
+
+    close() {
+        if (this.db) {
+            this.db.close();
+            this.initialized = false;
+        }
+    }
 }
 
-// ---------------------------------------------------------------------------
-// INGESTION STATE TRACKER
-// ---------------------------------------------------------------------------
+// CLI usage
+if (require.main === module) {
+    const args = process.argv.slice(2);
+    const command = args[0];
 
-let ingestionState = {
-  phase: 'initial',          // initial | scanning | indexing | complete
-  totalFiles: 0,
-  indexedFiles: 0,
-  scannedFolders: [],
-  errors: [],
-  startedAt: null,
-  completedAt: null
-};
+    if (command === 'build') {
+        const indexPath = args[1] || 'research_index.db';
+        const index = new ResearchIndex(indexPath);
+        index.initialize().then(() => {
+            console.log('Research index initialized at:', indexPath);
+            console.log('Stats:', JSON.stringify(index.getStats(), null, 2));
+            index.close();
+        }).catch(err => {
+            console.error('Failed:', err);
+            process.exit(1);
+        });
+    } else if (command === 'search') {
+        const query = args[1];
+        const mode = args[2] || 'fts';
+        const indexPath = args[3] || 'research_index.db';
 
-function startIngestion() {
-  ingestionState.phase = 'scanning';
-  ingestionState.startedAt = Date.now();
-  ingestionState.totalFiles = 0;
-  ingestionState.indexedFiles = 0;
-  ingestionState.errors = [];
-  ingestionState.scannedFolders = Object.keys(FOLDER_MAP);
-  return ingestionState;
+        if (!query) {
+            console.error('Usage: node research_index.js search <query> [fts|tfidf] [db_path]');
+            process.exit(1);
+        }
+
+        const index = new ResearchIndex(indexPath);
+        index.initialize().then(() => {
+            const results = mode === 'tfidf' ? index.tfidfSearch(query) : index.ftsSearch(query);
+            console.log(`Found ${results.length} results for "${query}" (${mode}):`);
+            results.forEach((r, i) => {
+                console.log(`  ${i + 1}. ${r.title} [score: ${r.rank || r.score}]`);
+            });
+            index.close();
+        }).catch(err => {
+            console.error('Failed:', err);
+            process.exit(1);
+        });
+    } else if (command === 'stats') {
+        const indexPath = args[1] || 'research_index.db';
+        const index = new ResearchIndex(indexPath);
+        index.initialize().then(() => {
+            console.log(JSON.stringify(index.getStats(), null, 2));
+            index.close();
+        }).catch(err => {
+            console.error('Failed:', err);
+            process.exit(1);
+        });
+    } else {
+        console.log(`
+Usage:
+  node research_index.js build [db_path]
+  node research_index.js search <query> [fts|tfidf] [db_path]
+  node research_index.js stats [db_path]
+        `);
+    }
 }
 
-function recordBatch(count, folder) {
-  ingestionState.indexedFiles += count;
-  ingestionState.totalFiles += count;
-}
-
-function completeIngestion() {
-  ingestionState.phase = 'complete';
-  ingestionState.completedAt = Date.now();
-  return ingestionState;
-}
-
-// ---------------------------------------------------------------------------
-// EXPORTS
-// ---------------------------------------------------------------------------
-
-module.exports = {
-  FOLDER_MAP,
-  NAMING_PATTERNS,
-  findFolder,
-  navigate,
-  classifyFile,
-  ingestionState,
-  startIngestion,
-  recordBatch,
-  completeIngestion
-};
+module.exports = ResearchIndex;
