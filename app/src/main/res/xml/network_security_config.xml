@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  network_security_config.xml — Zero network trust
+  Blocks all cleartext traffic. Refuses user-added CAs.
+  Only system certificates permitted. No internet at runtime.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <!-- No domain-specific overrides. No exceptions. -->
+</network-security-config>

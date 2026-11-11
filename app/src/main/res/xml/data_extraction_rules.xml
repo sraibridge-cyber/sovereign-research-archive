@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  data_extraction_rules.xml — Offline-first data governance
+  Blocks all cloud backup. Allows local device-to-device transfer
+  for the research database, ghost kernel database, and shared prefs.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <include domain="database" path="research_db" />
+        <include domain="database" path="ghost_kernel_db" />
+        <include domain="sharedpref" path="." />
+    </device-transfer>
+</data-extraction-rules>
