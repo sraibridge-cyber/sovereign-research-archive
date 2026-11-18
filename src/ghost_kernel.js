@@ -81,140 +81,148 @@ function sha3_512(data) {
   return _keccak512Fallback(data);
 }
 
-// Minimal Keccak-512 fallback (FIPS 202, r=576, c=1024, output 512 bits).
-// This is a compact, correct implementation for environments without crypto.
+// SHA3-512 fallback (FIPS 202: Keccak-f[1600], rate 576 bits, domain suffix 0x06) for
+// engines without a crypto module, such as Rhino on Android. Each 64-bit lane is held as
+// two 32-bit halves, because JavaScript numbers lose precision above 2^53. Input strings
+// are encoded as UTF-8 the same way Node's crypto does (lone surrogates become U+FFFD),
+// so this returns the same digest as crypto.createHash('sha3-512').
+var _SHA3_RC = [
+  0x00000001, 0x00000000, 0x00008082, 0x00000000, 0x0000808a, 0x80000000,
+  0x80008000, 0x80000000, 0x0000808b, 0x00000000, 0x80000001, 0x00000000,
+  0x80008081, 0x80000000, 0x00008009, 0x80000000, 0x0000008a, 0x00000000,
+  0x00000088, 0x00000000, 0x80008009, 0x00000000, 0x8000000a, 0x00000000,
+  0x8000808b, 0x00000000, 0x0000008b, 0x80000000, 0x00008089, 0x80000000,
+  0x00008003, 0x80000000, 0x00008002, 0x80000000, 0x00000080, 0x80000000,
+  0x0000800a, 0x00000000, 0x8000000a, 0x80000000, 0x80008081, 0x80000000,
+  0x00008080, 0x80000000, 0x80000001, 0x00000000, 0x80008008, 0x80000000
+];
+
+// Rotation offsets indexed by lane x + 5 * y.
+var _SHA3_RHO = [
+  0, 1, 62, 28, 27,
+  36, 44, 6, 55, 20,
+  3, 10, 43, 25, 39,
+  41, 45, 15, 21, 8,
+  18, 2, 61, 56, 14
+];
+
 function _keccak512Fallback(msg) {
-  var RC = [
-    0x0000000000000001, 0x0000000000008082, 0x800000000000808a,
-    0x8000000080008000, 0x000000000000808b, 0x0000000080000001,
-    0x8000000080008081, 0x8000000000008009, 0x000000000000008a,
-    0x0000000000000088, 0x0000000080008009, 0x000000008000000a,
-    0x000000008000808b, 0x800000000000008b, 0x8000000000008089,
-    0x8000000000008003, 0x8000000000008002, 0x8000000000000080,
-    0x000000000000800a, 0x800000008000000a, 0x8000000080008081,
-    0x8000000000008080, 0x0000000080000001, 0x8000000080008008
-  ];
-  var ROT = [
-    [0,36,3,41,18],
-    [1,44,10,45,2],
-    [62,6,43,15,61],
-    [28,55,25,21,56],
-    [27,20,39,8,14]
-  ];
-  var state = new Array(25);
-  for (var i = 0; i < 25; i++) state[i] = 0;
-  var msgBytes = _strToBytes(msg);
-  var rate = 576; // bits
-  var rateBytes = rate / 8; // 72 bytes
-  var suffix = 0x01; // Keccak (not SHA3) uses 0x01 — but for SHA3-512 use 0x06
-  // SHA3-512 suffix per FIPS 202
-  suffix = 0x06;
-  var padded = _pad101(msgBytes, rateBytes, suffix);
-  // Absorb
-  for (var blk = 0; blk < padded.length; blk += rateBytes) {
-    for (var j = 0; j < rateBytes / 8; j++) {
-      var lane = 0;
-      for (var b = 0; b < 8; b++) {
-        lane |= padded[blk + j * 8 + b] << (b * 8);
-      }
-      state[j] ^= lane;
+  var rateBytes = 72;
+  var bytes = _utf8Bytes(String(msg));
+
+  // Pad: domain suffix 0x06, then 0x80 on the last byte of the block.
+  bytes.push(0x06);
+  while (bytes.length % rateBytes !== 0) bytes.push(0x00);
+  bytes[bytes.length - 1] |= 0x80;
+
+  var lo = [], hi = [], i;
+  for (i = 0; i < 25; i++) { lo[i] = 0; hi[i] = 0; }
+
+  for (var offset = 0; offset < bytes.length; offset += rateBytes) {
+    for (i = 0; i < rateBytes / 8; i++) {
+      var p = offset + i * 8;
+      lo[i] ^= bytes[p] | (bytes[p + 1] << 8) | (bytes[p + 2] << 16) | (bytes[p + 3] << 24);
+      hi[i] ^= bytes[p + 4] | (bytes[p + 5] << 8) | (bytes[p + 6] << 16) | (bytes[p + 7] << 24);
     }
-    _keccakF(state, RC, ROT);
+    _keccakF1600(lo, hi);
   }
-  // Squeeze 64 bytes (512 bits)
-  var out = '';
-  var squeezed = 0;
-  while (squeezed < 64) {
-    for (var j = 0; j < rateBytes / 8 && squeezed < 64; j++) {
-      var lane = state[j];
-      for (var b = 0; b < 8 && squeezed < 64; b++) {
-        out += ((lane >>> (b * 8)) & 0xff).toString(16).padStart(2, '0');
-        squeezed++;
+
+  // SHA3-512 output (64 bytes) fits in the first rate block: lanes 0..7, little-endian.
+  var hex = '';
+  for (i = 0; i < 8; i++) {
+    hex += _le32Hex(lo[i]) + _le32Hex(hi[i]);
+  }
+  return hex;
+}
+
+function _keccakF1600(lo, hi) {
+  var cLo = [], cHi = [], bLo = [], bHi = [];
+  var x, y, idx;
+  for (var round = 0; round < 24; round++) {
+    // Theta
+    for (x = 0; x < 5; x++) {
+      cLo[x] = lo[x] ^ lo[x + 5] ^ lo[x + 10] ^ lo[x + 15] ^ lo[x + 20];
+      cHi[x] = hi[x] ^ hi[x + 5] ^ hi[x + 10] ^ hi[x + 15] ^ hi[x + 20];
+    }
+    for (x = 0; x < 5; x++) {
+      var nLo = cLo[(x + 1) % 5], nHi = cHi[(x + 1) % 5];
+      var dLo = cLo[(x + 4) % 5] ^ ((nLo << 1) | (nHi >>> 31));
+      var dHi = cHi[(x + 4) % 5] ^ ((nHi << 1) | (nLo >>> 31));
+      for (y = 0; y < 25; y += 5) {
+        lo[x + y] ^= dLo;
+        hi[x + y] ^= dHi;
       }
     }
-    if (squeezed < 64) _keccakF(state, RC, ROT);
+    // Rho and Pi
+    for (x = 0; x < 5; x++) {
+      for (y = 0; y < 5; y++) {
+        idx = x + 5 * y;
+        var r = _SHA3_RHO[idx], l = lo[idx], h = hi[idx], rl, rh;
+        if (r === 0) {
+          rl = l; rh = h;
+        } else if (r < 32) {
+          rl = (l << r) | (h >>> (32 - r));
+          rh = (h << r) | (l >>> (32 - r));
+        } else if (r === 32) {
+          rl = h; rh = l;
+        } else {
+          var s = r - 32;
+          rl = (h << s) | (l >>> (32 - s));
+          rh = (l << s) | (h >>> (32 - s));
+        }
+        var dst = y + 5 * ((2 * x + 3 * y) % 5);
+        bLo[dst] = rl;
+        bHi[dst] = rh;
+      }
+    }
+    // Chi
+    for (y = 0; y < 25; y += 5) {
+      for (x = 0; x < 5; x++) {
+        lo[x + y] = bLo[x + y] ^ (~bLo[((x + 1) % 5) + y] & bLo[((x + 2) % 5) + y]);
+        hi[x + y] = bHi[x + y] ^ (~bHi[((x + 1) % 5) + y] & bHi[((x + 2) % 5) + y]);
+      }
+    }
+    // Iota
+    lo[0] ^= _SHA3_RC[2 * round];
+    hi[0] ^= _SHA3_RC[2 * round + 1];
+  }
+}
+
+function _le32Hex(v) {
+  var out = '';
+  for (var i = 0; i < 4; i++) {
+    var b = (v >>> (8 * i)) & 0xff;
+    out += (b < 16 ? '0' : '') + b.toString(16);
   }
   return out;
 }
 
-function _keccakF(state, RC, ROT) {
-  for (var rnd = 0; rnd < 24; rnd++) {
-    // Theta
-    var C = new Array(5);
-    var D = new Array(5);
-    for (var x = 0; x < 5; x++) {
-      C[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
-    }
-    for (var x = 0; x < 5; x++) {
-      D[x] = C[(x + 4) % 5] ^ _rotl64(C[(x + 1) % 5], 1);
-    }
-    for (var x = 0; x < 5; x++) {
-      for (var y = 0; y < 5; y++) {
-        state[x + y * 5] ^= D[x];
-      }
-    }
-    // Rho + Pi
-    var B = new Array(25);
-    for (var x = 0; x < 5; x++) {
-      for (var y = 0; y < 5; y++) {
-        B[y + ((2 * x + 3 * y) % 5) * 5] = _rotl64(state[x + y * 5], ROT[x][y % 5]);
-      }
-    }
-    // Chi
-    for (var x = 0; x < 5; x++) {
-      for (var y = 0; y < 5; y++) {
-        state[x + y * 5] = B[x + y * 5] ^ ((~B[(x + 1) % 5 + y * 5]) & B[(x + 2) % 5 + y * 5]);
-      }
-    }
-    // Iota
-    state[0] ^= RC[rnd];
-  }
-}
-
-function _rotl64(v, n) {
-  n = n & 63;
-  if (n === 0) return v;
-  // Use BigInt-free 64-bit rotate via two 32-bit halves
-  var hi = Math.floor(v / 0x100000000);
-  var lo = v & 0xFFFFFFFF;
-  if (n < 32) {
-    var nhi = (hi << n) | (lo >>> (32 - n));
-    var nlo = (lo << n) | (hi >>> (32 - n));
-    return (nhi * 0x100000000) + (nlo >>> 0);
-  } else {
-    var nn = n - 32;
-    var nlo2 = (hi << nn) | (lo >>> (32 - nn));
-    var nhi2 = (lo << nn) | (hi >>> (32 - nn));
-    return (nhi2 * 0x100000000) + (nlo2 >>> 0);
-  }
-}
-
-function _strToBytes(s) {
-  var bytes = [];
+function _utf8Bytes(s) {
+  var out = [];
   for (var i = 0; i < s.length; i++) {
     var c = s.charCodeAt(i);
-    if (c < 128) {
-      bytes.push(c);
-    } else if (c < 2048) {
-      bytes.push((c >> 6) | 192);
-      bytes.push((c & 63) | 128);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      var d = i + 1 < s.length ? s.charCodeAt(i + 1) : 0;
+      if (d >= 0xdc00 && d <= 0xdfff) {
+        c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00);
+        i++;
+      } else {
+        c = 0xfffd;
+      }
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      c = 0xfffd;
+    }
+    if (c < 0x80) {
+      out.push(c);
+    } else if (c < 0x800) {
+      out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+    } else if (c < 0x10000) {
+      out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
     } else {
-      bytes.push((c >> 12) | 224);
-      bytes.push(((c >> 6) & 63) | 128);
-      bytes.push((c & 63) | 128);
+      out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
     }
   }
-  return bytes;
-}
-
-function _pad101(msgBytes, rateBytes, suffix) {
-  var padded = msgBytes.slice();
-  padded[padded.length] = suffix;
-  while (padded.length % rateBytes !== rateBytes - 1) {
-    padded[padded.length] = 0;
-  }
-  padded[padded.length] = 0x80;
-  return padded;
+  return out;
 }
 
 
@@ -951,3 +959,4 @@ var GHOSTKernel = {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = GHOSTKernel;
 }
+
