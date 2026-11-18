@@ -29,6 +29,7 @@ echo ""
 
 echo "[3/5] Copying archive.db to APK assets..."
 if [ -f archive.db ]; then
+  mkdir -p app/src/main/assets
   cp archive.db app/src/main/assets/archive.db
   echo "  OK: archive.db copied to assets."
 fi
@@ -47,7 +48,11 @@ echo ""
 echo "[5/5] Verifying zero network permissions..."
 APK_PATH=$(find app/build/outputs/apk -name "*.apk" 2>/dev/null | head -1)
 if [ -n "$APK_PATH" ]; then
-  PERMISSIONS=$(aapt dump permissions "$APK_PATH" 2>/dev/null || true)
+  AAPT=$(command -v aapt || ls "${ANDROID_HOME:-/nonexistent}"/build-tools/*/aapt 2>/dev/null | sort -V | tail -1 || true)
+  if [ -z "$AAPT" ]; then
+    echo "FAILED: aapt not found; cannot verify network permissions."; exit 1
+  fi
+  PERMISSIONS=$("$AAPT" dump permissions "$APK_PATH")
   if echo "$PERMISSIONS" | grep -qi "INTERNET\|ACCESS_NETWORK\|CHANGE_NETWORK"; then
     echo "FAILED: APK contains network permissions!"; exit 1
   fi
