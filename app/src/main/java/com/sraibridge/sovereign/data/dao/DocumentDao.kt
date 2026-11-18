@@ -2,52 +2,43 @@ package com.sraibridge.sovereign.data.dao
 
 import androidx.room.Dao
 import androidx.room.Query
+import androidx.room.RawQuery
+import androidx.sqlite.db.SupportSQLiteQuery
 import com.sraibridge.sovereign.data.entity.DocumentEntity
-import kotlinx.coroutines.flow.Flow
+import com.sraibridge.sovereign.data.entity.MerkleSealEntity
 
 @Dao
 interface DocumentDao {
-    @Query(
-        """
-        SELECT d.*, s.original_name AS source_name
-        FROM documents d
-        JOIN sources s ON s.source_id = d.source_id
-        WHERE documents_fts MATCH :query
-        ORDER BY rank
-        LIMIT :limit
-        """
-    )
-    fun searchFts(query: String, limit: Int = 50): Flow<List<DocumentWithSource>>
-
-    @Query("SELECT * FROM documents WHERE source_id = :sourceId")
-    suspend fun getDocumentBySourceId(sourceId: String): DocumentEntity?
-
     @Query("SELECT * FROM documents WHERE id = :id")
     suspend fun getDocument(id: Long): DocumentEntity?
+
+    @Query("SELECT * FROM documents WHERE id IN (:ids)")
+    suspend fun getDocuments(ids: List<Long>): List<DocumentEntity>
 
     @Query("SELECT COUNT(*) FROM documents")
     suspend fun getDocumentCount(): Int
 
+    @Query("SELECT * FROM documents ORDER BY ingested_at DESC LIMIT :limit")
+    suspend fun getRecentDocuments(limit: Int): List<DocumentEntity>
+
+    /** Plain substring search, used when the FTS5 index is missing or unsupported. */
     @Query(
         """
-        SELECT d.*, s.original_name AS source_name
-        FROM documents d
-        JOIN sources s ON s.source_id = d.source_id
-        ORDER BY d.ingested_at DESC
+        SELECT * FROM documents
+        WHERE title LIKE :pattern OR content_plain LIKE :pattern
+        ORDER BY ingested_at DESC
         LIMIT :limit
         """
     )
-    fun getRecentDocuments(limit: Int = 20): Flow<List<DocumentWithSource>>
-}
+    suspend fun likeSearch(pattern: String, limit: Int): List<DocumentEntity>
 
-data class DocumentWithSource(
-    val id: Long,
-    val source_id: String,
-    val title: String,
-    val content_plain: String,
-    val sha3_512: String,
-    val source_path: String?,
-    val file_type: String?,
-    val ingested_at: String?,
-    val source_name: String?
-)
+    @Query("SELECT * FROM merkle_seals ORDER BY id DESC LIMIT 1")
+    suspend fun getLatestSeal(): MerkleSealEntity?
+
+    /**
+     * For queries against `documents_fts`. Room does not model FTS5 virtual tables, so
+     * those queries cannot be checked at compile time and go through here.
+     */
+    @RawQuery
+    suspend fun rawDocuments(query: SupportSQLiteQuery): List<DocumentEntity>
+}
