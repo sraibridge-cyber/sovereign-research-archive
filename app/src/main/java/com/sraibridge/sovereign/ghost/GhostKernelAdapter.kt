@@ -2,97 +2,87 @@ package com.sraibridge.sovereign.ghost
 
 import android.content.Context
 import android.util.Log
+import org.json.JSONObject
 import org.mozilla.javascript.Context as RhinoContext
 import org.mozilla.javascript.ScriptableObject
-import java.io.File
-import java.security.MessageDigest
 
 /**
- * Adapter that loads and runs the GHOST kernel (ghost_kernel.js) on Android
- * using Mozilla Rhino (no V8 dependency, no network).
+ * Loads and runs the GHOST kernel (ghost_kernel.js) on Android using Mozilla Rhino
+ * (no V8 dependency, no network). build_apk.sh copies src/ghost_kernel.js into the
+ * app assets before the Gradle build.
  *
- * GHOST runs in IN-PROCESS dispatch mode — no port binding.
+ * The kernel exposes `createKernel()` through `module.exports`; this adapter creates one
+ * in-memory kernel (persist: false) and talks to it through `kernel.dispatch({action, payload})`,
+ * which returns JSON. GHOST runs in IN-PROCESS dispatch mode — no port binding.
+ *
+ * Rhino contexts are bound to the thread that entered them: call every method from the
+ * same thread that called [loadKernel].
  */
 class GhostKernelAdapter(private val appContext: Context) {
 
     companion object {
         private const val TAG = "GhostKernel"
         private const val KERNEL_ASSET = "ghost_kernel.js"
+        private const val BOOTSTRAP = "var module = { exports: {} };"
+        private const val CREATE = "var __ghost = module.exports.createKernel({ persist: false });"
     }
 
     private var rhinoContext: RhinoContext? = null
     private var scope: ScriptableObject? = null
     private var kernelLoaded = false
-    private var kernelSeal: String = ""
 
     data class GhostResult(
         val action: String,
-        val payload: String,
-        val seal: String,
-        val coherence: Double
+        val ok: Boolean,
+        /** The kernel's full reply, as JSON. */
+        val json: String
     )
 
     /**
-     * Load the GHOST kernel from assets and evaluate it.
+     * Load the GHOST kernel from assets and create an in-memory kernel instance.
      */
     fun loadKernel(): Boolean {
         return try {
-            rhinoContext = RhinoContext.enter()
-            rhinoContext?.optimizationLevel = -1  // interpretive mode for Android
-
-            scope = rhinoContext?.initStandardObjects() as ScriptableObject
+            val cx = RhinoContext.enter()
+            rhinoContext = cx  // set first, so release() exits the context if loading fails
+            cx.optimizationLevel = -1  // interpretive mode for Android
+            cx.languageVersion = RhinoContext.VERSION_ES6
+            val s = cx.initStandardObjects()
 
             val kernelJs = appContext.assets.open(KERNEL_ASSET)
                 .bufferedReader().use { it.readText() }
 
-            rhinoContext?.evaluateString(scope, kernelJs, KERNEL_ASSET, 1, null)
+            cx.evaluateString(s, BOOTSTRAP, "bootstrap", 1, null)
+            cx.evaluateString(s, kernelJs, KERNEL_ASSET, 1, null)
+            cx.evaluateString(s, CREATE, "create", 1, null)
 
-            // Verify kernel seal
-            val sealFn = scope?.get("seal_kernel", scope)
-            if (sealFn != null && sealFn is org.mozilla.javascript.Function) {
-                kernelSeal = RhinoContext.toString(
-                    sealFn.call(rhinoContext, scope, scope, emptyArray<Any>())
-                )
-            }
-
+            scope = s
             kernelLoaded = true
-            Log.i(TAG, "GHOST kernel loaded. Seal: $kernelSeal")
+            Log.i(TAG, "GHOST kernel loaded: ${evaluate("module.exports.version")}")
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load GHOST kernel", e)
+            release()
             false
-        } finally {
-            // Keep context open for dispatch calls
         }
     }
 
     /**
-     * Dispatch an action to the GHOST kernel.
+     * Dispatch an action (for example "ingest" or "ping") with a JSON payload.
      */
-    fun dispatch(action: String, payload: String): GhostResult? {
+    fun dispatch(action: String, payloadJson: String = "{}"): GhostResult? {
         if (!kernelLoaded) {
             Log.w(TAG, "dispatch called before kernel loaded")
             return null
         }
-
         return try {
-            val dispatchFn = scope?.get("dispatch", scope)
-            if (dispatchFn == null || dispatchFn !is org.mozilla.javascript.Function) {
-                Log.w(TAG, "dispatch function not found in kernel")
-                return null
-            }
-
-            val result = dispatchFn.call(rhinoContext, scope, scope, arrayOf(action, payload))
-            val resultStr = RhinoContext.toString(result)
-
-            // Parse result JSON
-            val parts = resultStr.split("|")
-            GhostResult(
-                action = if (parts.size > 0) parts[0] else action,
-                payload = if (parts.size > 1) parts[1] else resultStr,
-                seal = if (parts.size > 2) parts[2] else kernelSeal,
-                coherence = if (parts.size > 3) parts[3].toDoubleOrNull() ?: 0.0 else 0.0
+            val s = scope ?: return null
+            ScriptableObject.putProperty(s, "__action", action)
+            ScriptableObject.putProperty(s, "__payload", payloadJson)
+            val json = evaluate(
+                "JSON.stringify(__ghost.dispatch({ action: __action, payload: JSON.parse(__payload) }))"
             )
+            GhostResult(action, JSONObject(json).optBoolean("ok", false), json)
         } catch (e: Exception) {
             Log.e(TAG, "dispatch failed", e)
             null
@@ -100,31 +90,39 @@ class GhostKernelAdapter(private val appContext: Context) {
     }
 
     /**
-     * Search the corpus using GHOST kernel coherence calculus.
+     * Merkle root over the kernel's long-term memory, computed by the kernel itself.
      */
-    fun searchWithGhost(query: String, results: List<String>): GhostResult? {
-        return dispatch("SEARCH", """{"query":"$query","candidates":[${results.joinToString(",") {"\"$it\""}}]}""")
-    }
+    fun getSeal(): String =
+        if (kernelLoaded) evaluate("module.exports.computeMerkleRoot(__ghost.ltmStore)") else ""
 
     /**
-     * Get the kernel's Merkle seal.
-     */
-    fun getSeal(): String = kernelSeal
-
-    /**
-     * Verify a document against its SHA3-512 hash.
+     * Check a document's text against the SHA3-512 stored in archive.db (documents.sha3_512).
+     * Uses the kernel's own SHA3-512, because Android's MessageDigest does not offer SHA3 on
+     * every API level the app supports.
      */
     fun verifyDocument(content: String, expectedHash: String): Boolean {
-        val digest = MessageDigest.getInstance("SHA3-512")
-        val hashBytes = digest.digest(content.toByteArray())
-        val actualHash = hashBytes.joinToString("") { "%02x".format(it) }
-        return actualHash.equals(expectedHash, ignoreCase = true)
+        if (!kernelLoaded) return false
+        val s = scope ?: return false
+        ScriptableObject.putProperty(s, "__text", content)
+        val actual = evaluate("module.exports.sha3_512(__text)")
+        return actual.equals(expectedHash, ignoreCase = true)
     }
 
     fun release() {
-        try {
-            RhinoContext.exit()
-        } catch (_: Exception) {}
+        if (rhinoContext != null) {
+            try {
+                RhinoContext.exit()
+            } catch (_: Exception) {
+            }
+        }
+        rhinoContext = null
+        scope = null
         kernelLoaded = false
+    }
+
+    private fun evaluate(script: String): String {
+        val cx = rhinoContext ?: error("kernel not loaded")
+        val s = scope ?: error("kernel not loaded")
+        return RhinoContext.toString(cx.evaluateString(s, script, "adapter", 1, null))
     }
 }

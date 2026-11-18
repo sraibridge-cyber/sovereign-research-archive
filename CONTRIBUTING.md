@@ -15,7 +15,8 @@ This project is built for permanence. Every contribution should reflect that.
 - Fork the repo
 - Create a feature branch from `main`
 - Make your changes
-- Run the ingestion test: `cd tools && python -m pytest`
+- Run the tests: `npm test` (kernel tests, SHA3-512 fallback check, ingest tests). The ingest tests alone: `python3 -m unittest discover -s tools` (pytest also collects them)
+- If you change the archive schema or seal format, change `tools/ingest.py`, `src/research_index.js` and the Room entities together
 - Open a PR with a clear description of what changed and why
 
 ## Code Style

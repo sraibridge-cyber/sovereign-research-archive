@@ -5,7 +5,8 @@
   "main": "src/start_ghost.js",
   "scripts": {
     "start": "node src/start_ghost.js",
-    "test": "node src/test_ghost.js",
+    "test": "node src/test_ghost.js && node src/test_sha3_fallback.js && python3 -m unittest discover -s tools",
+    "verify": "python3 tools/ingest.py --verify --db archive.db",
     "ingest": "node src/ingest_pipeline.js",
     "build-index": "node src/research_index.js",
     "build-apk": "bash build_apk.sh"

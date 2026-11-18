@@ -9,12 +9,14 @@ Handles:
 - Plaintext normalization
 - SQLite FTS5 table creation with TF-IDF embeddings
 - SHA3-512 content hashing for dedup
-- Merkle seal chaining on every write batch
+- A SHA3-512 seal chain: one seal per ingested document, binding its content hash
+- Failed files recorded in ingest_failures with the reason, not omitted
+- --verify: recompute every content hash and seal; non-zero exit on any mismatch
 
 Usage:
-  python3 tools/ingest.py --dir /path/to/files --db research_index.db
-  python3 tools/ingest.py --dir /path/to/files --db research_index.db --dry-run
-  python3 tools/ingest.py --watch /path/to/files --db research_index.db
+  python3 tools/ingest.py --dir /path/to/files --db archive.db
+  python3 tools/ingest.py --dir /path/to/files --db archive.db --dry-run
+  python3 tools/ingest.py --verify --db archive.db
 """
 
 import argparse
@@ -48,6 +50,10 @@ except ImportError:
     pass
 
 
+class ExtractionError(Exception):
+    """A file could not be turned into text; the reason is recorded in ingest_failures."""
+
+
 class TextExtractor:
     """Extract plaintext from various file formats."""
 
@@ -57,19 +63,18 @@ class TextExtractor:
         try:
             if ext == ".pdf":
                 return TextExtractor._extract_pdf(filepath)
-            elif ext in (".docx", ".doc"):
+            elif ext == ".docx":
                 return TextExtractor._extract_docx(filepath)
+            elif ext == ".doc":
+                raise ExtractionError("legacy .doc is not supported; convert it to .docx or PDF")
             elif ext == ".html" or ext == ".htm":
                 return TextExtractor._extract_html(filepath)
-            elif ext == ".txt" or ext == ".md" or ext == ".csv":
-                return TextExtractor._read_text(filepath)
-            elif ext in (".json", ".xml", ".yaml", ".yml", ".toml"):
-                return TextExtractor._read_text(filepath)
             else:
                 return TextExtractor._read_text(filepath)
+        except ExtractionError:
+            raise
         except Exception as e:
-            print(f"  [WARN] Failed to extract {filepath}: {e}", file=sys.stderr)
-            return ""
+            raise ExtractionError(f"{type(e).__name__}: {e}") from e
 
     @staticmethod
     def _read_text(filepath: str) -> str:
@@ -79,24 +84,19 @@ class TextExtractor:
     @staticmethod
     def _extract_pdf(filepath: str) -> str:
         if not PDF_SUPPORT:
-            return f"[PDF extraction requires PyMuPDF or pdfplumber: {filepath}]\n"
-        try:
-            if "fitz" in sys.modules:
-                doc = fitz.open(filepath)
-                text = "\n\n".join(page.get_text() for page in doc)
-                doc.close()
-                return text
-            else:
-                with pdfplumber.open(filepath) as pdf:
-                    return "\n\n".join(page.extract_text() or "" for page in pdf.pages)
-        except Exception as e:
-            print(f"  [WARN] PDF extract error {filepath}: {e}", file=sys.stderr)
-            return ""
+            raise ExtractionError("PDF extraction requires PyMuPDF or pdfplumber")
+        if "fitz" in sys.modules:
+            doc = fitz.open(filepath)
+            text = "\n\n".join(page.get_text() for page in doc)
+            doc.close()
+            return text
+        with pdfplumber.open(filepath) as pdf:
+            return "\n\n".join(page.extract_text() or "" for page in pdf.pages)
 
     @staticmethod
     def _extract_docx(filepath: str) -> str:
         if not DOCX_SUPPORT:
-            return f"[DOCX extraction requires python-docx: {filepath}]\n"
+            raise ExtractionError("DOCX extraction requires python-docx")
         doc = Document(filepath)
         return "\n".join(p.text for p in doc.paragraphs)
 
@@ -112,8 +112,20 @@ class TextExtractor:
         return raw
 
 
+SEAL_FORMAT = "SRA-SEAL-1"
+
+
+def seal_input(version: int, prev_hash: str, doc_sha3: str, created_at: int) -> str:
+    """The exact string a seal hashes. Shared with src/research_index.js and --verify."""
+    return f"{SEAL_FORMAT}|{version}|{prev_hash}|{doc_sha3}|{created_at}"
+
+
 class CorpusIndex:
-    """SQLite FTS5 index with TF-IDF embeddings and Merkle seals."""
+    """SQLite FTS5 index with TF-IDF term frequencies and a SHA3-512 seal chain.
+
+    The schema is the contract the Android app's Room entities mirror
+    (app/src/main/java/com/sraibridge/sovereign/data/entity). Change both together.
+    """
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -168,88 +180,149 @@ class CorpusIndex:
                 version INTEGER NOT NULL,
                 seal_hash TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                description TEXT
+                description TEXT,
+                doc_sha3 TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS ingest_failures (
+                source_path TEXT PRIMARY KEY,
+                reason TEXT NOT NULL,
+                recorded_at INTEGER NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_documents_sha3 ON documents(sha3_512);
             CREATE INDEX IF NOT EXISTS idx_term_frequencies_term ON term_frequencies(term);
             CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_path);
         """)
+        # Databases created before doc_sha3 existed get the column added in place.
+        columns = {row[1] for row in c.execute("PRAGMA table_info(merkle_seals)")}
+        if "doc_sha3" not in columns:
+            c.execute("ALTER TABLE merkle_seals ADD COLUMN doc_sha3 TEXT")
         self.conn.commit()
 
     def sha3(self, data: str) -> str:
         return hashlib.sha3_512(data.encode("utf-8")).hexdigest()
 
-    def _build_term_frequencies(self, doc_id: int, text: str):
+    def _build_term_frequencies(self, c, doc_id: int, text: str):
         terms = re.findall(r"[a-z0-9-]{3,}", text.lower())
         freq = {}
         for t in terms:
             freq[t] = freq.get(t, 0) + 1
+        c.executemany(
+            "INSERT OR REPLACE INTO term_frequencies (doc_id, term, freq) VALUES (?, ?, ?)",
+            [(doc_id, term, count) for term, count in freq.items()],
+        )
 
-        c = self.conn.cursor()
-        c.execute("BEGIN TRANSACTION")
-        for term, count in freq.items():
-            c.execute(
-                "INSERT OR REPLACE INTO term_frequencies (doc_id, term, freq) VALUES (?, ?, ?)",
-                (doc_id, term, count)
-            )
-        c.execute("COMMIT")
-
-    def _update_corpus_stats(self):
-        c = self.conn.cursor()
+    def _update_corpus_stats(self, c, now_ms: int):
         doc_count = c.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
         term_count = c.execute("SELECT COUNT(DISTINCT term) FROM term_frequencies").fetchone()[0]
         c.execute(
             "INSERT OR REPLACE INTO corpus_stats (id, total_docs, total_terms, last_updated) VALUES (1, ?, ?, ?)",
-            (doc_count, term_count, int(time.time() * 1000))
+            (doc_count, term_count, now_ms),
         )
-        self.conn.commit()
 
-    def _create_seal(self, description: str) -> str:
-        c = self.conn.cursor()
-        row = c.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM merkle_seals").fetchone()
-        version = row[0] if row else 1
+    def _create_seal(self, c, doc_sha3: str, description: str, now_ms: int) -> str:
+        version = c.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM merkle_seals").fetchone()[0]
         prev = c.execute("SELECT seal_hash FROM merkle_seals ORDER BY id DESC LIMIT 1").fetchone()
         prev_hash = prev[0] if prev else "GENESIS"
-        doc_count = c.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-        seal_data = f"v{version}|{prev_hash}|{doc_count}|{description}|{int(time.time() * 1000)}"
-        seal_hash = self.sha3(seal_data)
+        seal_hash = self.sha3(seal_input(version, prev_hash, doc_sha3, now_ms))
         c.execute(
-            "INSERT INTO merkle_seals (version, seal_hash, created_at, description) VALUES (?, ?, ?, ?)",
-            (version, seal_hash, int(time.time() * 1000), description)
+            "INSERT INTO merkle_seals (version, seal_hash, created_at, description, doc_sha3) VALUES (?, ?, ?, ?, ?)",
+            (version, seal_hash, now_ms, description, doc_sha3),
         )
-        self.conn.commit()
         return seal_hash
 
     def ingest(self, title: str, source_path: str, content_text: str, content_plain: str, file_type: str) -> dict:
+        """Add one document, its FTS row, term frequencies and seal in a single transaction."""
         sha3 = self.sha3(content_plain)
         word_count = len(content_plain.split())
+        now_ms = int(time.time() * 1000)
 
-        c = self.conn.cursor()
-        existing = c.execute("SELECT id FROM documents WHERE sha3_512 = ?", (sha3,)).fetchone()
-        if existing:
-            return {"deduped": True, "id": existing[0], "sha3": sha3}
+        with self.conn:
+            c = self.conn.cursor()
+            existing = c.execute("SELECT id FROM documents WHERE sha3_512 = ?", (sha3,)).fetchone()
+            c.execute("DELETE FROM ingest_failures WHERE source_path = ?", (source_path,))
+            if existing:
+                return {"deduped": True, "id": existing[0], "sha3": sha3}
 
-        c.execute(
-            """INSERT INTO documents (title, source_path, content_text, content_plain, sha3_512, file_type, ingested_at, word_count)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (title, source_path, content_text, content_plain, sha3, file_type, int(time.time() * 1000), word_count)
-        )
-        doc_id = c.lastrowid
-
-        c.execute(
-            "INSERT INTO documents_fts (rowid, title, content_plain, content_text) VALUES (?, ?, ?, ?)",
-            (doc_id, title, content_plain, content_text)
-        )
-
-        self._build_term_frequencies(doc_id, content_plain)
-        self._update_corpus_stats()
-        seal = self._create_seal(f"Ingested: {title}")
+            c.execute(
+                """INSERT INTO documents (title, source_path, content_text, content_plain, sha3_512, file_type, ingested_at, word_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (title, source_path, content_text, content_plain, sha3, file_type, now_ms, word_count),
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO documents_fts (rowid, title, content_plain, content_text) VALUES (?, ?, ?, ?)",
+                (doc_id, title, content_plain, content_text),
+            )
+            self._build_term_frequencies(c, doc_id, content_plain)
+            self._update_corpus_stats(c, now_ms)
+            seal = self._create_seal(c, sha3, f"Ingested: {title}", now_ms)
 
         return {"deduped": False, "id": doc_id, "sha3": sha3, "word_count": word_count, "seal": seal}
 
+    def record_failure(self, source_path: str, reason: str):
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO ingest_failures (source_path, reason, recorded_at) VALUES (?, ?, ?)",
+                (source_path, reason, int(time.time() * 1000)),
+            )
+
+    def verify(self) -> list:
+        """Recompute every content hash and every seal. Returns a list of problems (empty = OK)."""
+        problems = []
+        c = self.conn.cursor()
+
+        docs = {}
+        for doc_id, content_plain, stored in c.execute("SELECT id, content_plain, sha3_512 FROM documents"):
+            if self.sha3(content_plain) != stored:
+                problems.append(f"document {doc_id}: content does not match its sha3_512")
+            docs[stored] = doc_id
+
+        prev_hash = "GENESIS"
+        sealed = set()
+        expected_version = 1
+        for seal_id, version, seal_hash, created_at, doc_sha3 in c.execute(
+            "SELECT id, version, seal_hash, created_at, doc_sha3 FROM merkle_seals ORDER BY id ASC"
+        ):
+            if version != expected_version:
+                problems.append(f"seal {seal_id}: version {version}, expected {expected_version}")
+            if doc_sha3 is None:
+                problems.append(f"seal {seal_id}: no doc_sha3 (written by an older ingest, cannot be verified)")
+            elif self.sha3(seal_input(version, prev_hash, doc_sha3, created_at)) != seal_hash:
+                problems.append(f"seal {seal_id}: hash does not match its inputs (chain broken here)")
+            if doc_sha3 is not None:
+                if doc_sha3 not in docs:
+                    problems.append(f"seal {seal_id}: sealed document is missing")
+                sealed.add(doc_sha3)
+            prev_hash = seal_hash
+            expected_version = version + 1
+
+        for sha3, doc_id in docs.items():
+            if sha3 not in sealed:
+                problems.append(f"document {doc_id}: has no seal")
+
+        try:
+            c.execute("INSERT INTO documents_fts(documents_fts) VALUES('integrity-check')")
+        except sqlite3.DatabaseError as e:
+            problems.append(f"documents_fts: integrity check failed ({e})")
+        self.conn.rollback()
+
+        stats = c.execute("SELECT total_docs FROM corpus_stats WHERE id = 1").fetchone()
+        if docs and (stats is None or stats[0] != len(docs)):
+            problems.append(f"corpus_stats.total_docs is {stats[0] if stats else 'missing'}, expected {len(docs)}")
+        return problems
+
+    def root_seal(self):
+        row = self.conn.execute("SELECT seal_hash FROM merkle_seals ORDER BY id DESC LIMIT 1").fetchone()
+        return row[0] if row else None
+
     def fts_search(self, query: str, limit: int = 50) -> list:
-        fts_query = " ".join(f"{t}*" for t in query.split())
+        # Quote each token so punctuation (c++, e-mail, quotes) cannot break FTS5 syntax.
+        tokens = [t.replace('"', "") for t in query.split()]
+        fts_query = " ".join(f'"{t}"*' for t in tokens if t)
+        if not fts_query:
+            return []
         c = self.conn.cursor()
         c.execute(
             """SELECT d.id, d.title, d.content_plain, d.sha3_512, d.source_path, rank
@@ -304,9 +377,11 @@ class CorpusIndex:
         doc_count = c.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
         term_count = c.execute("SELECT COUNT(DISTINCT term) FROM term_frequencies").fetchone()[0]
         seal = c.execute("SELECT * FROM merkle_seals ORDER BY id DESC LIMIT 1").fetchone()
+        failures = c.execute("SELECT COUNT(*) FROM ingest_failures").fetchone()[0]
         return {
             "documentCount": doc_count,
             "uniqueTerms": term_count,
+            "recordedFailures": failures,
             "lastSeal": seal
         }
 
@@ -341,14 +416,40 @@ def scan_directory(dir_path: str, recursive: bool = True) -> list:
 def main():
     parser = argparse.ArgumentParser(description="Sovereign Research Archive Corpus Extractor")
     parser.add_argument("--dir", help="Directory of research files to ingest")
-    parser.add_argument("--db", default="research_index.db", help="Output SQLite database path")
+    parser.add_argument("--db", default="archive.db", help="SQLite database path (build_apk.sh ships archive.db)")
     parser.add_argument("--dry-run", action="store_true", help="Scan and report only, no DB write")
-    parser.add_argument("--watch", help="Watch directory for new files (polling mode)")
+    parser.add_argument("--watch", help="Not implemented; rejected with an error")
     parser.add_argument("--search", help="Search the index (FTS5)")
     parser.add_argument("--tfidf", help="Search the index (TF-IDF)")
     parser.add_argument("--stats", action="store_true", help="Show index statistics")
-    parser.add_argument("--merkle", action="store_true", help="Show Merkle seal chain")
+    parser.add_argument("--merkle", action="store_true", help="Show the seal chain")
+    parser.add_argument("--verify", action="store_true",
+                        help="Recompute content hashes and the seal chain; exit 1 on any mismatch")
+    parser.add_argument("--strict", action="store_true",
+                        help="With --dir: exit 1 if any file failed to ingest")
     args = parser.parse_args()
+
+    if args.watch:
+        print("--watch is not implemented. Re-run with --dir after adding files.", file=sys.stderr)
+        sys.exit(2)
+
+    if args.verify:
+        if not os.path.exists(args.db):
+            print(f"Index not found: {args.db}", file=sys.stderr)
+            sys.exit(1)
+        idx = CorpusIndex(args.db)
+        problems = idx.verify()
+        doc_count = idx.stats()["documentCount"]
+        root = idx.root_seal()
+        idx.close()
+        if problems:
+            print(f"VERIFY FAILED: {len(problems)} problem(s) in {args.db}")
+            for p in problems[:50]:
+                print(f"  - {p}")
+            sys.exit(1)
+        print(f"VERIFY OK: {doc_count} documents, every content hash and seal recomputed.")
+        print(f"  Root seal: {root or '(empty archive)'}")
+        return
 
     if args.search or args.tfidf:
         if not os.path.exists(args.db):
@@ -385,12 +486,12 @@ def main():
         idx.close()
         return
 
-    if not args.dir and not args.watch:
+    if not args.dir:
         parser.print_help()
         sys.exit(1)
 
     # Ingest mode
-    files = scan_directory(args.dir) if args.dir else []
+    files = scan_directory(args.dir)
     print(f"Found {len(files)} files in {args.dir}")
 
     if args.dry_run:
@@ -412,7 +513,8 @@ def main():
         try:
             text = TextExtractor.extract(fp)
             if not text.strip():
-                print("SKIP (empty)")
+                idx.record_failure(rel, "no text extracted")
+                print("FAIL: no text extracted (recorded)")
                 failed += 1
                 continue
 
@@ -435,7 +537,8 @@ def main():
                 ingested += 1
 
         except Exception as e:
-            print(f"FAIL: {e}")
+            idx.record_failure(rel, str(e))
+            print(f"FAIL: {e} (recorded)")
             failed += 1
 
     idx.close()
@@ -451,7 +554,11 @@ def main():
     stats = idx2.stats()
     print(f"  Total docs: {stats['documentCount']}")
     print(f"  Unique terms: {stats['uniqueTerms']}")
+    print(f"  Recorded failures: {stats['recordedFailures']} (see table ingest_failures)")
     idx2.close()
+
+    if args.strict and failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,19 @@
 // research_index.js — Sovereign Research Archive Ingestion Orchestrator
 // Builds FTS5 + TF-IDF search database from ingested documents
-// SHA3-512 Merkle seals on every write
+// SHA3-512 seal chain: one seal per ingested document, binding its content hash.
+// Schema and seal format are shared with tools/ingest.py, which also verifies them
+// (python3 tools/ingest.py --verify --db archive.db). Change both together.
 
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+
+const SEAL_FORMAT = 'SRA-SEAL-1';
+
+// The exact string a seal hashes; must match seal_input() in tools/ingest.py.
+function sealInput(version, prevHash, docSha3, createdAt) {
+    return `${SEAL_FORMAT}|${version}|${prevHash}|${docSha3}|${createdAt}`;
+}
 
 class ResearchIndex {
     constructor(dbPath) {
@@ -68,13 +77,25 @@ class ResearchIndex {
                 version INTEGER NOT NULL,
                 seal_hash TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                description TEXT
+                description TEXT,
+                doc_sha3 TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS ingest_failures (
+                source_path TEXT PRIMARY KEY,
+                reason TEXT NOT NULL,
+                recorded_at INTEGER NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_documents_sha3 ON documents(sha3_512);
             CREATE INDEX IF NOT EXISTS idx_term_frequencies_term ON term_frequencies(term);
             CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_path);
         `);
+        // Databases created before doc_sha3 existed get the column added in place.
+        const columns = this.db.prepare('PRAGMA table_info(merkle_seals)').all().map(c => c.name);
+        if (!columns.includes('doc_sha3')) {
+            this.db.exec('ALTER TABLE merkle_seals ADD COLUMN doc_sha3 TEXT');
+        }
     }
 
     sha3(data) {
@@ -86,36 +107,41 @@ class ResearchIndex {
 
         const sha3 = this.sha3(contentPlain);
         const wordCount = contentPlain.split(/\s+/).filter(w => w.length > 0).length;
+        const nowMs = Date.now();
 
-        const existing = this.db.prepare('SELECT id FROM documents WHERE sha3_512 = ?').get(sha3);
-        if (existing) {
-            return { deduped: true, id: existing.id, sha3 };
-        }
+        // One transaction per document: the row, its FTS entry, term frequencies,
+        // corpus stats and seal are written together or not at all.
+        const write = this.db.transaction(() => {
+            this.db.prepare('DELETE FROM ingest_failures WHERE source_path = ?').run(sourcePath);
+            const existing = this.db.prepare('SELECT id FROM documents WHERE sha3_512 = ?').get(sha3);
+            if (existing) {
+                return { deduped: true, id: existing.id, sha3 };
+            }
 
-        const insert = this.db.prepare(`
-            INSERT INTO documents (title, source_path, content_text, content_plain, sha3_512, file_type, ingested_at, word_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `);
+            const result = this.db.prepare(`
+                INSERT INTO documents (title, source_path, content_text, content_plain, sha3_512, file_type, ingested_at, word_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(title, sourcePath, contentText, contentPlain, sha3, fileType, ingestedAt ?? nowMs, wordCount);
+            const docId = result.lastInsertRowid;
 
-        const result = insert.run(title, sourcePath, contentText, contentPlain, sha3, fileType, ingestedAt, wordCount);
-        const docId = result.lastInsertRowid;
+            this._buildTermFrequencies(docId, contentPlain);
+            this.db.prepare(`
+                INSERT INTO documents_fts (rowid, title, content_plain, content_text)
+                VALUES (?, ?, ?, ?)
+            `).run(docId, title, contentPlain, contentText);
+            this._updateCorpusStats(nowMs);
+            const seal = this._createSeal(sha3, `Ingested: ${title}`, nowMs);
 
-        // Build term frequencies for TF-IDF
-        this._buildTermFrequencies(docId, contentPlain);
+            return { deduped: false, id: docId, sha3, wordCount, seal };
+        });
+        return write();
+    }
 
-        // Update FTS5 index
+    recordFailure(sourcePath, reason) {
+        if (!this.initialized) throw new Error('ResearchIndex not initialized');
         this.db.prepare(`
-            INSERT INTO documents_fts (rowid, title, content_plain, content_text)
-            VALUES (?, ?, ?, ?)
-        `).run(docId, title, contentPlain, contentText);
-
-        // Update corpus stats
-        this._updateCorpusStats();
-
-        // Create Merkle seal
-        this._createSeal(`Ingested: ${title}`);
-
-        return { deduped: false, id: docId, sha3, wordCount };
+            INSERT OR REPLACE INTO ingest_failures (source_path, reason, recorded_at) VALUES (?, ?, ?)
+        `).run(sourcePath, String(reason), Date.now());
     }
 
     _buildTermFrequencies(docId, text) {
@@ -139,26 +165,25 @@ class ResearchIndex {
         batch([...freqMap.entries()]);
     }
 
-    _updateCorpusStats() {
+    _updateCorpusStats(nowMs = Date.now()) {
         const docCount = this.db.prepare('SELECT COUNT(*) AS count FROM documents').get();
         const termCount = this.db.prepare('SELECT COUNT(DISTINCT term) AS count FROM term_frequencies').get();
         this.db.prepare(`
             INSERT OR REPLACE INTO corpus_stats (id, total_docs, total_terms, last_updated)
             VALUES (1, ?, ?, ?)
-        `).run(docCount.count, termCount.count, Date.now());
+        `).run(docCount.count, termCount.count, nowMs);
     }
 
-    _createSeal(description) {
+    _createSeal(docSha3, description, nowMs = Date.now()) {
         const version = (this.db.prepare('SELECT COALESCE(MAX(version), 0) + 1 AS v FROM merkle_seals').get()?.v) || 1;
         const prevSeal = this.db.prepare('SELECT seal_hash FROM merkle_seals ORDER BY id DESC LIMIT 1').get();
-        const docCount = this.db.prepare('SELECT COUNT(*) AS count FROM documents').get().count;
-        const sealData = `v${version}|${prevSeal?.seal_hash || 'GENESIS'}|${docCount}|${description}|${Date.now()}`;
-        const sealHash = this.sha3(sealData);
+        // The timestamp hashed is the one stored, so the seal can be recomputed later.
+        const sealHash = this.sha3(sealInput(version, prevSeal?.seal_hash || 'GENESIS', docSha3, nowMs));
 
         this.db.prepare(`
-            INSERT INTO merkle_seals (version, seal_hash, created_at, description)
-            VALUES (?, ?, ?, ?)
-        `).run(version, sealHash, Date.now(), description);
+            INSERT INTO merkle_seals (version, seal_hash, created_at, description, doc_sha3)
+            VALUES (?, ?, ?, ?, ?)
+        `).run(version, sealHash, nowMs, description, docSha3);
 
         return sealHash;
     }
@@ -167,7 +192,13 @@ class ResearchIndex {
 
     ftsSearch(query, limit = 50) {
         if (!this.initialized) throw new Error('ResearchIndex not initialized');
-        const ftsQuery = query.split(/\s+/).map(t => `${t}*`).join(' ');
+        // Quote each token so punctuation (c++, e-mail, quotes) cannot break FTS5 syntax.
+        const ftsQuery = query.split(/\s+/)
+            .map(t => t.replace(/"/g, ''))
+            .filter(t => t.length > 0)
+            .map(t => `"${t}"*`)
+            .join(' ');
+        if (!ftsQuery) return [];
         return this.db.prepare(`
             SELECT d.*, rank
             FROM documents_fts
@@ -293,13 +324,18 @@ if (require.main === module) {
             console.error('Failed:', err);
             process.exit(1);
         });
+    } else if (command === 'verify') {
+        console.error('Verification lives in tools/ingest.py: python3 tools/ingest.py --verify --db <db_path>');
+        process.exit(2);
     } else {
         console.log(`
 Usage:
   node research_index.js build [db_path]
   node research_index.js search <query> [fts|tfidf] [db_path]
   node research_index.js stats [db_path]
+  (verify an archive with: python3 tools/ingest.py --verify --db <db_path>)
         `);
+        if (command) process.exit(1);
     }
 }
 

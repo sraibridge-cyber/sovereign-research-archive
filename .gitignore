@@ -21,3 +21,5 @@ obj/
 *.db-wal
 *.db-shm
 app/release/
+# Copied in by build_apk.sh; the source of truth is src/ghost_kernel.js
+app/src/main/assets/ghost_kernel.js
