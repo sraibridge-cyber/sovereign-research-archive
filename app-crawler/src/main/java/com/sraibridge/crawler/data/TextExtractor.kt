@@ -82,7 +82,7 @@ object TextExtractor {
         }
         return sb.toString().trim().ifEmpty {
             // Fallback: try to extract any readable text
-            raw.replace(Regex["[^\\x20-\\x7E\\x0A\\x0D]+"), " ")
+            raw.replace(Regex("[^\\x20-\\x7E\\x0A\\x0D]+"), " ")
                 .replace(Regex("\\s+"), " ")
                 .trim()
         }
@@ -108,7 +108,7 @@ object TextExtractor {
         }
     }
 
-    private fun sha3_512(data: ByteArray): String {
+    fun sha3_512(data: ByteArray): String {
         val digest = MessageDigest.getInstance("SHA3-512")
         val hashBytes = digest.digest(data)
         return hashBytes.joinToString("") { "%02x".format(it) }
