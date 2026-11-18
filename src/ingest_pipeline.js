@@ -119,6 +119,9 @@ async function runPass(passNumber, dryRun = false) {
   console.log(`\n=== Ingestion Pass ${passNumber}${dryRun ? ' (DRY RUN)' : ''} ===`);
   console.log(`State: ${state.ingested} ingested, ${state.skipped} skipped, ${state.errors.length} errors so far\n`);
 
+  // Passes 2-4 are not implemented yet. They must not be recorded as completed.
+  let implemented = true;
+
   switch (passNumber) {
     case 1:
       console.log('[Pass 1] Mapping drive structure...');
@@ -142,21 +145,29 @@ async function runPass(passNumber, dryRun = false) {
       console.log('[Pass 2] Ingesting text files...');
       console.log('[Pass 2] Text ingestion requires drive source mapping — run with --source=/path/to/drive/mount');
       console.log('[Pass 2] Placeholder: scan source, classify, copy text files to repo structure');
+      implemented = false;
       break;
 
     case 3:
       console.log('[Pass 3] Ingesting media/binary files...');
       console.log('[Pass 3] Media ingestion requires drive source mapping — run with --source=/path/to/drive/mount');
+      implemented = false;
       break;
 
     case 4:
       console.log('[Verify] Running verification...');
       console.log('[Verify] Checking file counts, orphan detection, SHA consistency');
+      implemented = false;
       break;
 
     default:
       console.error(`Unknown pass: ${passNumber}`);
       process.exit(1);
+  }
+
+  if (!implemented) {
+    console.error(`\n=== Pass ${passNumber} is not implemented; nothing was done and it was not recorded as completed ===`);
+    process.exit(2);
   }
 
   if (!dryRun) {
