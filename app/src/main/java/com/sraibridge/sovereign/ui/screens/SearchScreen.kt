@@ -10,16 +10,19 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.sraibridge.sovereign.data.dao.DocumentWithSource
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.sraibridge.sovereign.viewmodel.SearchResult
+import com.sraibridge.sovereign.viewmodel.SearchViewModel
+
+private val SEARCH_MODES = listOf("fts" to "FTS5", "tfidf" to "TF-IDF", "ghost" to "GHOST")
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SearchScreen(
-    onDocumentClick: (String) -> Unit
+    onDocumentClick: (Long) -> Unit,
+    viewModel: SearchViewModel = viewModel()
 ) {
-    var query by remember { mutableStateOf("") }
-    var results by remember { mutableStateOf<List<DocumentWithSource>>(emptyList()) }
-    var isSearching by remember { mutableStateOf(false) }
+    val state by viewModel.uiState.collectAsState()
 
     Column(
         modifier = Modifier
@@ -33,15 +36,15 @@ fun SearchScreen(
         )
         Spacer(modifier = Modifier.height(4.dp))
         Text(
-            text = "GHOST kernel v9.1.0 — offline, sealed, sovereign",
+            text = "GHOST kernel v9.1.0 \u2014 offline, sealed, sovereign",
             style = MaterialTheme.typography.labelLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Spacer(modifier = Modifier.height(16.dp))
 
         OutlinedTextField(
-            value = query,
-            onValueChange = { query = it },
+            value = state.query,
+            onValueChange = viewModel::onQueryChanged,
             modifier = Modifier.fillMaxWidth(),
             placeholder = { Text("Search research corpus...") },
             singleLine = true,
@@ -52,41 +55,35 @@ fun SearchScreen(
         )
         Spacer(modifier = Modifier.height(8.dp))
 
-        if (isSearching) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            SEARCH_MODES.forEach { (mode, label) ->
+                FilterChip(
+                    selected = state.searchMode == mode,
+                    onClick = { viewModel.setSearchMode(mode) },
+                    label = { Text(label) }
+                )
+            }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+
+        if (state.isLoading) {
             LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
         }
 
-        if (results.isEmpty() && query.isNotBlank() && !isSearching) {
-            Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "No results found",
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        } else if (results.isEmpty() && query.isBlank()) {
-            Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "Enter a search query to explore the archive",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        } else {
-            LazyColumn(
+        val error = state.error
+        when {
+            error != null -> CenteredMessage("Search failed: $error")
+            state.query.isBlank() -> CenteredMessage("Enter a search query to explore the archive")
+            state.query.trim().length < 3 -> CenteredMessage("Type at least 3 characters")
+            state.results.isEmpty() && !state.isLoading -> CenteredMessage("No results found")
+            else -> LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(results) { doc ->
+                items(state.results, key = { it.docId }) { result ->
                     DocumentResultCard(
-                        doc = doc,
-                        onClick = { onDocumentClick(doc.source_id) }
+                        result = result,
+                        onClick = { onDocumentClick(result.docId) }
                     )
                 }
             }
@@ -95,8 +92,22 @@ fun SearchScreen(
 }
 
 @Composable
+private fun CenteredMessage(text: String) {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
 fun DocumentResultCard(
-    doc: DocumentWithSource,
+    result: SearchResult,
     onClick: () -> Unit
 ) {
     Card(
@@ -109,19 +120,25 @@ fun DocumentResultCard(
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
             Text(
-                text = doc.title,
+                text = result.title,
                 style = MaterialTheme.typography.titleMedium,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis
             )
-            if (!doc.source_name.isNullOrBlank()) {
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(
-                    text = doc.source_name,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = result.snippet,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = result.score,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }

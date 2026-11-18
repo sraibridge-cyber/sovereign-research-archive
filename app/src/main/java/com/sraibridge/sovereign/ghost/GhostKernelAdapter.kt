@@ -51,7 +51,7 @@ class GhostKernelAdapter(private val appContext: Context) {
             val sealFn = scope?.get("seal_kernel", scope)
             if (sealFn != null && sealFn is org.mozilla.javascript.Function) {
                 kernelSeal = RhinoContext.toString(
-                    sealFn.call(rhinoContext, scope, scope, emptyArray())
+                    sealFn.call(rhinoContext, scope, scope, emptyArray<Any>())
                 )
             }
 

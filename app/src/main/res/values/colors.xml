@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Referenced by mipmap-anydpi-v26/ic_launcher.xml -->
+    <color name="ic_launcher_background">#FF0D1117</color>
+    <color name="ic_launcher_foreground">#FF3FB950</color>
+</resources>
