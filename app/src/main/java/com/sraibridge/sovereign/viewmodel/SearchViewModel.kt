@@ -4,13 +4,15 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.sraibridge.sovereign.data.ArchiveDatabase
-import com.sraibridge.sovereign.data.entity.DocumentEntity
+import com.sraibridge.sovereign.data.ArchiveRepository
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 data class SearchResult(
+    val docId: Long,
     val title: String,
     val snippet: String,
     val score: String
@@ -26,25 +28,26 @@ data class SearchUiState(
 
 class SearchViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val db = ArchiveDatabase.getInstance(application)
-    private val searchDao = db.searchDao()
-    private val semanticDao = db.semanticDao()
+    private val repository = ArchiveRepository(ArchiveDatabase.getInstance(application))
 
     private val _uiState = MutableStateFlow(SearchUiState())
     val uiState: StateFlow<SearchUiState> = _uiState.asStateFlow()
 
+    private var searchJob: Job? = null
+
     fun onQueryChanged(query: String) {
         _uiState.value = _uiState.value.copy(query = query)
-        if (query.length >= 3) {
+        if (query.trim().length >= 3) {
             performSearch()
         } else {
-            _uiState.value = _uiState.value.copy(results = emptyList())
+            searchJob?.cancel()
+            _uiState.value = _uiState.value.copy(results = emptyList(), isLoading = false, error = null)
         }
     }
 
     fun setSearchMode(mode: String) {
         _uiState.value = _uiState.value.copy(searchMode = mode)
-        if (_uiState.value.query.length >= 3) {
+        if (_uiState.value.query.trim().length >= 3) {
             performSearch()
         }
     }
@@ -54,66 +57,33 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
         val mode = _uiState.value.searchMode
         if (query.length < 3) return
 
-        viewModelScope.launch {
+        searchJob?.cancel()
+        searchJob = viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isLoading = true, error = null)
             try {
-                val results = when (mode) {
-                    "fts" -> ftsSearch(query)
-                    "tfidf" -> tfidfSearch(query)
-                    "ghost" -> ghostSearch(query)
-                    else -> ftsSearch(query)
+                val ranked = when (mode) {
+                    "tfidf" -> repository.tfidfSearch(query)
+                    // GHOST re-ranking is not wired yet; it uses the FTS5 results for now.
+                    "ghost" -> repository.ftsSearch(query)
+                    else -> repository.ftsSearch(query)
                 }
-                _uiState.value = _uiState.value.copy(
-                    results = results,
-                    isLoading = false
-                )
+                val results = ranked.mapNotNull { item ->
+                    val id = item.document.id ?: return@mapNotNull null
+                    SearchResult(
+                        docId = id,
+                        title = item.document.title,
+                        snippet = item.document.contentPlain.take(200),
+                        score = item.score?.let { "${item.method} %.3f".format(it) } ?: item.method
+                    )
+                }
+                _uiState.value = _uiState.value.copy(results = results, isLoading = false)
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
                     error = e.message ?: "Search failed"
                 )
             }
-        }
-    }
-
-    private suspend fun ftsSearch(query: String): List<SearchResult> {
-        // Room FTS5 MATCH syntax
-        val ftsQuery = query.split(" ").joinToString(" ") { "$it*" }
-        val docs = searchDao.ftsSearch(ftsQuery)
-        return docs.map { doc ->
-            SearchResult(
-                title = doc.title,
-                snippet = doc.content_plain.take(200),
-                score = "FTS5"
-            )
-        }
-    }
-
-    private suspend fun tfidfSearch(query: String): List<SearchResult> {
-        val terms = query.lowercase().split(Regex("\\W+")).filter { it.length > 2 }.distinct()
-        if (terms.isEmpty()) return emptyList()
-
-        val termsJson = terms.joinToString(",") { "\"$it\"" }
-        val docs = searchDao.tfidfSearch("[$termsJson]", 50)
-        return docs.map { doc ->
-            SearchResult(
-                title = doc.title,
-                snippet = doc.content_plain.take(200),
-                score = "TF-IDF"
-            )
-        }
-    }
-
-    private suspend fun ghostSearch(query: String): List<SearchResult> {
-        // FTS5 search then GHOST re-rank
-        val ftsQuery = query.split(" ").joinToString(" ") { "$it*" }
-        val docs = searchDao.ftsSearch(ftsQuery)
-        return docs.map { doc ->
-            SearchResult(
-                title = doc.title,
-                snippet = doc.content_plain.take(200),
-                score = "GHOST"
-            )
         }
     }
 }
