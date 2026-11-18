@@ -3,7 +3,7 @@ set -euo pipefail
 
 # build_apk.sh - Sovereign Research Archive APK builder
 # Invoked by: npm run build
-# Steps: verify kernel, verify archive.db seal, copy db to assets, build APK, verify zero-net
+# Steps: verify kernel, verify archive.db seals, copy kernel + db to assets, build APK, verify zero-net
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -15,21 +15,24 @@ echo ""
 
 echo "[1/5] Verifying GHOST kernel integrity..."
 node src/test_ghost.js || { echo "FAILED: Kernel verification failed."; exit 1; }
+node src/test_sha3_fallback.js || { echo "FAILED: Kernel SHA3-512 fallback differs from crypto."; exit 1; }
 echo "  OK: Kernel integrity verified."
 echo ""
 
-echo "[2/5] Verifying archive.db root seal..."
+echo "[2/5] Verifying archive.db content hashes and seal chain..."
 if [ -f archive.db ]; then
-  node src/research_index.js verify --db archive.db || { echo "FAILED: Seal verification failed."; exit 1; }
-  echo "  OK: Archive seal verified."
+  python3 tools/ingest.py --verify --db archive.db || { echo "FAILED: Seal verification failed."; exit 1; }
+  echo "  OK: Archive seals verified."
 else
   echo "  WARNING: archive.db not found. APK will ship without pre-built index."
 fi
 echo ""
 
-echo "[3/5] Copying archive.db to APK assets..."
+echo "[3/5] Copying GHOST kernel and archive.db to APK assets..."
+mkdir -p app/src/main/assets
+cp src/ghost_kernel.js app/src/main/assets/ghost_kernel.js
+echo "  OK: ghost_kernel.js copied to assets."
 if [ -f archive.db ]; then
-  mkdir -p app/src/main/assets
   cp archive.db app/src/main/assets/archive.db
   echo "  OK: archive.db copied to assets."
 fi
